@@ -44,6 +44,8 @@ const MAX_OUTPUT: usize = 8 << 30;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Backend {
+    /// Sections stored uncompressed; any outer compressor is applied to the whole stream.
+    Store = 0,
     Zstd = 1,
     Gzip = 2,
 }
@@ -51,9 +53,12 @@ enum Backend {
 impl Backend {
     fn from_byte(b: u8) -> Result<Self> {
         match b {
+            0 => Ok(Self::Store),
             1 => Ok(Self::Zstd),
             2 => Ok(Self::Gzip),
-            _ => bail!("unknown entropy backend byte {b:#04x}: expected 1 (zstd) or 2 (gzip)"),
+            _ => bail!(
+                "unknown entropy backend byte {b:#04x}: expected 0 (store), 1 (zstd) or 2 (gzip)"
+            ),
         }
     }
 }
@@ -236,6 +241,7 @@ fn put_section(out: &mut Vec<u8>, data: &[u8], backend: Backend) -> Result<usize
             gz.finish()?
         }
         Backend::Zstd => zstd::bulk::compress(data, ZSTD_LEVEL)?,
+        Backend::Store => data.to_vec(),
     };
     put_varint(out, data.len() as u64);
     put_varint(out, z.len() as u64);
@@ -271,6 +277,7 @@ fn get_section(
             d
         }
         Backend::Zstd => zstd::bulk::decompress(z, raw_len)?,
+        Backend::Store => z.to_vec(),
     };
     ensure!(
         data.len() == raw_len,
@@ -544,6 +551,7 @@ fn run(path: &Path) -> Result<()> {
     let t0 = Instant::now();
     let backend = match std::env::var("PKC_BACKEND").as_deref() {
         Ok("gzip") => Backend::Gzip,
+        Ok("store") => Backend::Store,
         _ => Backend::Zstd,
     };
     let (enc, s) = encode(&pf, backend)?;
@@ -561,6 +569,17 @@ fn run(path: &Path) -> Result<()> {
     ensure!(dec.raw == pf.raw, "payload mismatch after round trip");
     let file_exact = dec.to_file()? == file;
     let zstd_raw = zstd::bulk::compress(&pf.raw, ZSTD_LEVEL)?.len();
+    if backend == Backend::Store {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::new(LEDGER_GZIP_LEVEL));
+        gz.write_all(&enc)?;
+        let outer_gz = gz.finish()?.len();
+        let outer_zstd = zstd::bulk::compress(&enc, ZSTD_LEVEL)?.len();
+        println!(
+            "  outer layer over stored stream {:.3} MB: gzip6 {:.3} MB ({:.1}x) · zstd19 {:.3} MB ({:.1}x)",
+            mb(enc.len()), mb(outer_gz), file.len() as f64 / outer_gz as f64,
+            mb(outer_zstd), file.len() as f64 / outer_zstd as f64,
+        );
+    }
 
     println!(
         "{} k={} fixed={} σ={}\n  file(gzip6) {:>8.2} MB · raw {:>8.2} MB · zstd19(raw) {:>8.2} MB · codec {:>7.3} MB = {:.1}x vs file\n  \
