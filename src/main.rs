@@ -33,6 +33,29 @@ const GZIP_MAGIC: [u8; 3] = [0x1f, 0x8b, 0x08];
 /// `transient-crypto` `PK_COMPRESSION_LEVEL`.
 const LEDGER_GZIP_LEVEL: u32 = 6;
 const ZSTD_LEVEL: i32 = 19;
+/// Decoder limits: a stream is untrusted input, so every declared size is checked before it
+/// is allocated. `k` ≤ 26 covers the largest keys seen (~k = 19) with room to spare.
+const MAX_K: u32 = 26;
+const MAX_COLS: usize = 4096;
+const MAX_OUTPUT: usize = 8 << 30;
+
+/// Entropy coder for the transformed sections, recorded in the stream after the magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Backend {
+    Zstd = 1,
+    Gzip = 2,
+}
+
+impl Backend {
+    fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            1 => Ok(Self::Zstd),
+            2 => Ok(Self::Gzip),
+            _ => bail!("unknown entropy backend byte {b:#04x}: expected 1 (zstd) or 2 (gzip)"),
+        }
+    }
+}
 
 /// A parsed `.prover` file.
 struct ProverFile {
@@ -204,18 +227,14 @@ struct Sizes {
     escapes: usize,
 }
 
-/// Entropy backend for the transformed sections; `PKC_BACKEND=gzip` for the gzip-6 comparison.
-fn gzip_backend() -> bool {
-    std::env::var("PKC_BACKEND").is_ok_and(|b| b == "gzip")
-}
-
-fn zstd_section(out: &mut Vec<u8>, data: &[u8]) -> Result<usize> {
-    let z = if gzip_backend() {
-        let mut gz = GzEncoder::new(Vec::new(), Compression::new(LEDGER_GZIP_LEVEL));
-        gz.write_all(data)?;
-        gz.finish()?
-    } else {
-        zstd::bulk::compress(data, ZSTD_LEVEL)?
+fn put_section(out: &mut Vec<u8>, data: &[u8], backend: Backend) -> Result<usize> {
+    let z = match backend {
+        Backend::Gzip => {
+            let mut gz = GzEncoder::new(Vec::new(), Compression::new(LEDGER_GZIP_LEVEL));
+            gz.write_all(data)?;
+            gz.finish()?
+        }
+        Backend::Zstd => zstd::bulk::compress(data, ZSTD_LEVEL)?,
     };
     put_varint(out, data.len() as u64);
     put_varint(out, z.len() as u64);
@@ -223,34 +242,50 @@ fn zstd_section(out: &mut Vec<u8>, data: &[u8]) -> Result<usize> {
     Ok(z.len())
 }
 
-fn unzstd_section(buf: &[u8], at: &mut usize) -> Result<Vec<u8>> {
-    let raw_len = get_varint(buf, at)? as usize;
-    let z_len = get_varint(buf, at)? as usize;
-    let z = buf
-        .get(*at..*at + z_len)
-        .context("zstd section truncated")?;
+/// Reads one section, refusing to allocate more than `limit` bytes for it.
+fn get_section(
+    buf: &[u8],
+    at: &mut usize,
+    backend: Backend,
+    limit: usize,
+    what: &str,
+) -> Result<Vec<u8>> {
+    let raw_len = usize::try_from(get_varint(buf, at)?)?;
+    ensure!(
+        raw_len <= limit,
+        "{what} section claims {raw_len} bytes, limit for this key is {limit}"
+    );
+    let z_len = usize::try_from(get_varint(buf, at)?)?;
+    let z = at
+        .checked_add(z_len)
+        .and_then(|end| buf.get(*at..end))
+        .with_context(|| format!("{what} section truncated: needs {z_len} bytes at offset {at}"))?;
     *at += z_len;
-    let data = if gzip_backend() {
-        let mut d = Vec::with_capacity(raw_len);
-        GzDecoder::new(z).read_to_end(&mut d)?;
-        d
-    } else {
-        zstd::bulk::decompress(z, raw_len)?
+    let data = match backend {
+        Backend::Gzip => {
+            let mut d = Vec::with_capacity(raw_len);
+            GzDecoder::new(z)
+                .take(raw_len as u64 + 1)
+                .read_to_end(&mut d)?;
+            d
+        }
+        Backend::Zstd => zstd::bulk::decompress(z, raw_len)?,
     };
     ensure!(
         data.len() == raw_len,
-        "zstd section decoded to {} bytes, header says {raw_len}",
+        "{what} section decoded to {} bytes, header says {raw_len}",
         data.len()
     );
     Ok(data)
 }
 
-fn encode(pf: &ProverFile) -> Result<(Vec<u8>, Sizes)> {
+fn encode(pf: &ProverFile, backend: Backend) -> Result<(Vec<u8>, Sizes)> {
     let raw = &pf.raw;
     let t = Tail::locate(raw)?;
     let k = t.n.trailing_zeros();
     let mut s = Sizes::default();
     let mut out = MAGIC.to_vec();
+    out.push(backend as u8);
     for v in [t.fixed_cols, t.perm_cols, k as usize] {
         put_varint(&mut out, v as u64);
     }
@@ -259,7 +294,7 @@ fn encode(pf: &ProverFile) -> Result<(Vec<u8>, Sizes)> {
     let hdr_len = prefix.len();
     prefix.extend_from_slice(&raw[..t.start]);
     put_varint(&mut out, hdr_len as u64);
-    s.prefix = zstd_section(&mut out, &prefix)?;
+    s.prefix = put_section(&mut out, &prefix, backend)?;
 
     // Fixed: dictionary in first-seen order (deterministic), then per-cell varint indices.
     let mut dict: Vec<[u8; FE]> = Vec::new();
@@ -277,8 +312,8 @@ fn encode(pf: &ProverFile) -> Result<(Vec<u8>, Sizes)> {
         }
     }
     s.dict_entries = dict.len();
-    s.fixed_dict = zstd_section(&mut out, &dict.concat())?;
-    s.fixed_idx = zstd_section(&mut out, &idx)?;
+    s.fixed_dict = put_section(&mut out, &dict.concat(), backend)?;
+    s.fixed_idx = put_section(&mut out, &idx, backend)?;
 
     // σ: invert δ^c·ω^r to a cell index; store zigzag(cell - own) + 1, 0 = escape + raw bytes.
     let table = delta_omega(t.perm_cols, k);
@@ -303,7 +338,7 @@ fn encode(pf: &ProverFile) -> Result<(Vec<u8>, Sizes)> {
         }
     }
     s.perm_cells = t.perm_cols * t.n;
-    s.perm = zstd_section(&mut out, &perm)?;
+    s.perm = put_section(&mut out, &perm, backend)?;
     s.total = out.len();
     Ok((out, s))
 }
@@ -314,16 +349,45 @@ fn decode(buf: &[u8]) -> Result<ProverFile> {
         "not a PKC1 stream: bad magic {:02x?}",
         buf.get(..4)
     );
-    let mut at = 4;
-    let fixed_cols = get_varint(buf, &mut at)? as usize;
-    let perm_cols = get_varint(buf, &mut at)? as usize;
-    let k = get_varint(buf, &mut at)? as u32;
+    let backend = Backend::from_byte(*buf.get(4).context("stream ends before backend byte")?)?;
+    let mut at = 5;
+    let mut header = || -> Result<usize> { Ok(usize::try_from(get_varint(buf, &mut at)?)?) };
+    let (fixed_cols, perm_cols, k, hdr_len) = (header()?, header()?, header()?, header()?);
+    ensure!(
+        k <= MAX_K as usize,
+        "k = {k} exceeds the decoder limit {MAX_K}"
+    );
+    ensure!(
+        fixed_cols <= MAX_COLS && perm_cols <= MAX_COLS,
+        "{fixed_cols} fixed / {perm_cols} σ columns exceeds the decoder limit {MAX_COLS}"
+    );
+    let k = u32::try_from(k)?;
     let n = 1usize << k;
-    let hdr_len = get_varint(buf, &mut at)? as usize;
-    let prefix = unzstd_section(buf, &mut at)?;
-    let dict = unzstd_section(buf, &mut at)?;
-    let idx = unzstd_section(buf, &mut at)?;
-    let perm = unzstd_section(buf, &mut at)?;
+    // Both slices together; checked so a wasm32 `usize` cannot wrap.
+    let cells = (fixed_cols + perm_cols)
+        .checked_mul(n)
+        .context("cell count overflows usize")?;
+    let tail = cells
+        .checked_mul(FE)
+        .filter(|&b| b <= MAX_OUTPUT)
+        .with_context(|| {
+            format!("{cells} cells × {FE} B exceeds the decoder output limit {MAX_OUTPUT} B")
+        })?;
+    let prefix = get_section(buf, &mut at, backend, MAX_OUTPUT - tail, "prefix")?;
+    let dict = get_section(
+        buf,
+        &mut at,
+        backend,
+        fixed_cols * n * FE,
+        "fixed dictionary",
+    )?;
+    let idx = get_section(buf, &mut at, backend, fixed_cols * n * 10, "fixed index")?;
+    let perm = get_section(buf, &mut at, backend, perm_cols * n * (1 + FE), "σ")?;
+    ensure!(
+        hdr_len <= prefix.len(),
+        "outer header length {hdr_len} exceeds prefix {} B",
+        prefix.len()
+    );
     ensure!(
         at == buf.len(),
         "{} trailing bytes after last section",
@@ -332,9 +396,9 @@ fn decode(buf: &[u8]) -> Result<ProverFile> {
 
     let (outer_header, pk_prefix) = prefix.split_at(hdr_len);
     let mut raw = pk_prefix.to_vec();
-    let n_be = (n as u32).to_be_bytes();
+    let n_be = u32::try_from(n)?.to_be_bytes();
 
-    raw.extend_from_slice(&(fixed_cols as u32).to_be_bytes());
+    raw.extend_from_slice(&u32::try_from(fixed_cols)?.to_be_bytes());
     let mut i = 0;
     for _ in 0..fixed_cols {
         raw.extend_from_slice(&n_be);
@@ -347,25 +411,40 @@ fn decode(buf: &[u8]) -> Result<ProverFile> {
         }
     }
 
+    ensure!(
+        i == idx.len(),
+        "fixed index has {} trailing bytes",
+        idx.len() - i
+    );
+
     let table = delta_omega(perm_cols, k);
-    raw.extend_from_slice(&(perm_cols as u32).to_be_bytes());
+    raw.extend_from_slice(&u32::try_from(perm_cols)?.to_be_bytes());
     let mut i = 0;
     for c in 0..perm_cols {
         raw.extend_from_slice(&n_be);
         for r in 0..n {
             match get_varint(&perm, &mut i)? {
                 0 => {
-                    raw.extend_from_slice(perm.get(i..i + FE).context("escape truncated")?);
+                    let fe = i.checked_add(FE).and_then(|end| perm.get(i..end));
+                    raw.extend_from_slice(fe.context("σ escape truncated")?);
                     i += FE;
                 }
                 z => {
-                    let cell = (c * n + r) as i64 + unzigzag(z - 1);
-                    let cell = usize::try_from(cell).context("σ cell index negative")?;
+                    let own = i64::try_from(c * n + r)?;
+                    let cell = own
+                        .checked_add(unzigzag(z - 1))
+                        .and_then(|v| usize::try_from(v).ok());
+                    let cell = cell.context("σ cell index out of range")?;
                     raw.extend_from_slice(table.get(cell).context("σ cell index past table")?);
                 }
             }
         }
     }
+    ensure!(
+        i == perm.len(),
+        "σ stream has {} trailing bytes",
+        perm.len() - i
+    );
     Ok(ProverFile {
         outer_header: outer_header.to_vec(),
         raw,
@@ -382,7 +461,11 @@ fn run(path: &Path) -> Result<()> {
     let t = Tail::locate(&pf.raw)?;
 
     let t0 = Instant::now();
-    let (enc, s) = encode(&pf)?;
+    let backend = match std::env::var("PKC_BACKEND").as_deref() {
+        Ok("gzip") => Backend::Gzip,
+        _ => Backend::Zstd,
+    };
+    let (enc, s) = encode(&pf, backend)?;
     let t_enc = t0.elapsed();
     let t0 = Instant::now();
     let dec = decode(&enc)?;
@@ -457,5 +540,108 @@ mod tests {
         let t = delta_omega(8, 10);
         let set: std::collections::BTreeSet<_> = t.iter().collect();
         assert_eq!(set.len(), t.len());
+    }
+
+    const K: u32 = 4;
+    const N: usize = 1 << K;
+
+    fn push_slice(raw: &mut Vec<u8>, cols: &[Vec<[u8; FE]>]) {
+        raw.extend_from_slice(&u32::try_from(cols.len()).unwrap().to_be_bytes());
+        for col in cols {
+            raw.extend_from_slice(&u32::try_from(col.len()).unwrap().to_be_bytes());
+            col.iter().for_each(|fe| raw.extend_from_slice(fe));
+        }
+    }
+
+    /// A minimal key: 2 fixed columns (repeating constants) and 2 σ columns that are the
+    /// identity except one swapped pair and one value outside the δ^c·ω^r table (an escape).
+    fn synthetic_key() -> ProverFile {
+        let fixed: Vec<Vec<[u8; FE]>> = (0..2u8)
+            .map(|c| {
+                (0..N)
+                    .map(|r| [u8::try_from(r % 3).unwrap() + c; FE])
+                    .collect()
+            })
+            .collect();
+        let table = delta_omega(2, K);
+        let mut perm: Vec<Vec<[u8; FE]>> = table.chunks(N).map(<[_]>::to_vec).collect();
+        perm[0].swap(1, 5);
+        perm[1][7] = [0xee; FE];
+        let mut raw = vec![0, u8::try_from(K).unwrap(), 0xab, 0xcd];
+        push_slice(&mut raw, &fixed);
+        push_slice(&mut raw, &perm);
+        ProverFile {
+            outer_header: b"tag:".to_vec(),
+            raw,
+        }
+    }
+
+    #[test]
+    fn synthetic_round_trip_both_backends() {
+        let pf = synthetic_key();
+        for backend in [Backend::Zstd, Backend::Gzip] {
+            let (enc, s) = encode(&pf, backend).unwrap();
+            assert_eq!(s.escapes, 1, "{backend:?}");
+            assert_eq!(s.wired_cells, 2, "{backend:?}");
+            let dec = decode(&enc).unwrap();
+            assert_eq!(dec.outer_header, pf.outer_header);
+            assert_eq!(dec.raw, pf.raw, "{backend:?}");
+        }
+    }
+
+    /// Builds a stream by hand so the decoder can be fed headers an encoder would never emit.
+    fn pack(cols: (u64, u64), k: u64, hdr_len: u64, sections: [&[u8]; 4]) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.push(Backend::Zstd as u8);
+        for v in [cols.0, cols.1, k, hdr_len] {
+            put_varint(&mut out, v);
+        }
+        for s in sections {
+            put_section(&mut out, s, Backend::Zstd).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn decode_rejects_hostile_headers() {
+        let ok_prefix: &[u8] = b"tag:\0\x04";
+        let cases: [(&str, Vec<u8>); 5] = [
+            (
+                "k too large",
+                pack((0, 0), 200, 0, [ok_prefix, b"", b"", b""]),
+            ),
+            (
+                "hdr_len past prefix",
+                pack((0, 0), K.into(), 99, [ok_prefix, b"", b"", b""]),
+            ),
+            (
+                "σ table too large",
+                pack((0, 1 << 20), 30, 4, [ok_prefix, b"", b"", b""]),
+            ),
+            (
+                "fixed idx trailing bytes",
+                pack((0, 0), K.into(), 4, [ok_prefix, b"", b"\0", b""]),
+            ),
+            (
+                "σ trailing bytes",
+                pack((0, 0), K.into(), 4, [ok_prefix, b"", b"", b"\x01"]),
+            ),
+        ];
+        for (what, buf) in cases {
+            assert!(decode(&buf).is_err(), "{what}: decoder accepted it");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_section_bomb() {
+        let mut buf = MAGIC.to_vec();
+        buf.push(Backend::Zstd as u8);
+        for v in [0, 0, u64::from(K), 0] {
+            put_varint(&mut buf, v);
+        }
+        put_varint(&mut buf, 1 << 40); // claims a 1 TB section
+        put_varint(&mut buf, 1);
+        buf.push(0);
+        assert!(decode(&buf).is_err());
     }
 }
