@@ -3,6 +3,8 @@ name = "pk-codec"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
+repository = "https://github.com/gilescope/pk-codec"
 description = "Spike: structure-aware lossless codec for Midnight prover keys"
 
 [dependencies]
