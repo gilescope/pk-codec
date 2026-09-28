@@ -1,0 +1,16 @@
+[package]
+name = "pk-codec"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike: structure-aware lossless codec for Midnight prover keys"
+
+[dependencies]
+anyhow = "1"
+ff = "0.13"
+flate2 = "1"
+midnight-curves = "0.2.0"
+zstd = "0.13"
+
+[profile.release]
+debug = 1
