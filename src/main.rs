@@ -451,13 +451,38 @@ fn decode(buf: &[u8]) -> Result<ProverFile> {
     })
 }
 
+/// Columns whose load-time FFTs are trivial: constant fixed columns, identity σ columns.
+fn column_stats(raw: &[u8], t: &Tail) {
+    let fixed_const = (0..t.fixed_cols)
+        .filter(|&c| {
+            let col = &raw[t.col_offset(t.start, c)..][..FE * t.n];
+            col.chunks_exact(FE).all(|fe| fe == &col[..FE])
+        })
+        .count();
+    let table = delta_omega(t.perm_cols, t.n.trailing_zeros());
+    let perm_id = (0..t.perm_cols)
+        .filter(|&c| {
+            let col = &raw[t.col_offset(t.perm_start(), c)..][..FE * t.n];
+            col.chunks_exact(FE)
+                .zip(&table[c * t.n..])
+                .all(|(fe, id)| fe == id)
+        })
+        .count();
+    println!(
+        "  trivial columns: fixed constant {fixed_const}/{} · σ identity {perm_id}/{}",
+        t.fixed_cols, t.perm_cols
+    );
+}
+
 fn mb(b: usize) -> f64 {
     b as f64 / 1e6
 }
 
 fn run(path: &Path) -> Result<()> {
     let file = std::fs::read(path)?;
+    let t0 = Instant::now();
     let pf = ProverFile::parse(&file)?;
+    let t_gunzip = t0.elapsed();
     let t = Tail::locate(&pf.raw)?;
 
     let t0 = Instant::now();
@@ -470,6 +495,10 @@ fn run(path: &Path) -> Result<()> {
     let t0 = Instant::now();
     let dec = decode(&enc)?;
     let t_dec = t0.elapsed();
+    if std::env::var_os("PKC_STATS").is_some() {
+        column_stats(&pf.raw, &t);
+        println!("  gunzip {t_gunzip:.2?} vs codec decode {t_dec:.2?}");
+    }
 
     ensure!(dec.outer_header == pf.outer_header, "outer header mismatch");
     ensure!(dec.raw == pf.raw, "payload mismatch after round trip");
