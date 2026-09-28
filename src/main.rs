@@ -25,6 +25,7 @@ use anyhow::{bail, ensure, Context, Result};
 use ff::{Field, PrimeField};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use midnight_curves::bls12_381::Fq as Fr;
+use midnight_curves::fft::best_fft;
 use midnight_curves::serde_traits::SerdeObject;
 
 const MAGIC: &[u8; 4] = b"PKC1";
@@ -451,6 +452,61 @@ fn decode(buf: &[u8]) -> Result<ProverFile> {
     })
 }
 
+/// Rebuilds what `ProvingKey::read` derives on load (coefficient form via inverse FFT, then
+/// an extended coset via forward FFT) and reports its compressibility and cost. `ext` is the
+/// extended-domain factor as a power of two; it depends on the circuit's gate degree, which
+/// this file does not record.
+fn fft_forms(raw: &[u8], t: &Tail, ext: u32) -> Result<()> {
+    let k = t.n.trailing_zeros();
+    let root = |bits: u32| (bits..Fr::S).fold(Fr::ROOT_OF_UNITY, |w, _| w.square());
+    let omega_inv = root(k).invert().unwrap();
+    let n_inv = Fr::from(u64::try_from(t.n)?).invert().unwrap();
+    let ext_omega = root(k + ext);
+    let zeta = Fr::MULTIPLICATIVE_GENERATOR;
+    let cols: Vec<usize> = (0..t.fixed_cols)
+        .map(|c| t.col_offset(t.start, c))
+        .chain((0..t.perm_cols).map(|c| t.col_offset(t.perm_start(), c)))
+        .collect();
+    let (mut coeff_bytes, mut coset_bytes) = (Vec::new(), Vec::new());
+    let (mut t_ifft, mut t_fft) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    for off in cols {
+        let mut a: Vec<Fr> = raw[off..][..FE * t.n]
+            .chunks_exact(FE)
+            .map(Fr::from_raw_bytes_unchecked)
+            .collect();
+        let t0 = Instant::now();
+        best_fft(&mut a, omega_inv, k);
+        a.iter_mut().for_each(|v| *v *= n_inv);
+        t_ifft += t0.elapsed();
+        a.iter().for_each(|v| coeff_bytes.extend(fe_bytes(v)));
+        let t0 = Instant::now();
+        let mut shift = Fr::ONE;
+        let mut e: Vec<Fr> = a
+            .iter()
+            .map(|&v| {
+                let x = v * shift;
+                shift *= zeta;
+                x
+            })
+            .collect();
+        e.resize(t.n << ext, Fr::ZERO);
+        best_fft(&mut e, ext_omega, k + ext);
+        t_fft += t0.elapsed();
+        e.iter().for_each(|v| coset_bytes.extend(fe_bytes(v)));
+    }
+    let z = |b: &[u8]| zstd::bulk::compress(b, 3).map(|z| 100.0 * z.len() as f64 / b.len() as f64);
+    println!(
+        "  coeff form {:.1} MB → zstd {:.1}% · coset ×{} {:.1} MB → zstd {:.1}%\n  \
+         load FFTs (rayon, all cores): inverse {t_ifft:.2?} + extended {t_fft:.2?}",
+        mb(coeff_bytes.len()),
+        z(&coeff_bytes)?,
+        1 << ext,
+        mb(coset_bytes.len()),
+        z(&coset_bytes)?,
+    );
+    Ok(())
+}
+
 /// Columns whose load-time FFTs are trivial: constant fixed columns, identity σ columns.
 fn column_stats(raw: &[u8], t: &Tail) {
     let fixed_const = (0..t.fixed_cols)
@@ -498,6 +554,7 @@ fn run(path: &Path) -> Result<()> {
     if std::env::var_os("PKC_STATS").is_some() {
         column_stats(&pf.raw, &t);
         println!("  gunzip {t_gunzip:.2?} vs codec decode {t_dec:.2?}");
+        fft_forms(&pf.raw, &t, 2)?;
     }
 
     ensure!(dec.outer_header == pf.outer_header, "outer header mismatch");
